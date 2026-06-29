@@ -1,1 +1,7 @@
-
+-- change over time trends
+-- cumulative
+-- performance 
+-- data segmentation
+-- part_to_whole_analysis
+-- report_customers
+-- report_products
