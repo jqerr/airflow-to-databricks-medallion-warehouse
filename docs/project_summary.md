@@ -2,50 +2,53 @@
 
 ## Overview
 
-A SQL Server data warehouse built on the **Medallion Architecture** (Bronze → Silver → Gold), with the entire pipeline automated and orchestrated by **Apache Airflow** running in **Docker**. It ingests raw CRM and ERP data from CSV files, cleans and standardizes it, models it into a star schema for reporting, and runs unattended on a daily schedule with automated data-quality gating.
+A Medallion Architecture (Bronze → Silver → Gold) data warehouse, originally built on SQL Server + Airflow, migrated to a cloud-native stack: **Databricks** (Unity Catalog, Delta Lake, Serverless compute) for transformation and governance, and **AWS S3** as the raw data lake, with the full pipeline orchestrated by a **Databricks Job**.
 
-**One-liner:** Took an existing SQL Server data warehouse project and built a full orchestration layer around it with Airflow and Docker — including debugging real infrastructure issues and adding automated data quality checks that gate the pipeline.
+**One-liner:** Migrated an existing SQL Server + Airflow data warehouse to Databricks + AWS — re-platforming stored-procedure ETL into Spark SQL, connecting Unity Catalog to S3 via IAM, and replacing Airflow with native Databricks Workflows.
 
 ---
 
 ## Tech Stack
 
-- **SQL Server** — warehouse engine; stored procedures for load logic, views for the gold/reporting layer
-- **SSMS** — manual DB administration, permissions, debugging
-- **Apache Airflow** — scheduling, task dependencies, monitoring, retries
-- **Docker / Docker Compose** — runs Airflow's full service stack (webserver, scheduler, worker, triggerer, Postgres metadata DB, Redis) in isolated containers
-- **Python** — Airflow DAG definitions (TaskFlow API), using `MsSqlHook` to talk to SQL Server
+- **Databricks** — Unity Catalog (`datawarehouse` catalog with `bronze`/`silver`/`gold` schemas), Delta Lake managed tables, Serverless SQL Warehouse compute
+- **Databricks Jobs (Workflows)** — task orchestration, scheduling, dependency chaining, and failure notifications
+- **AWS S3** — raw CRM/ERP CSV landing zone
+- **AWS IAM** — Storage Credential (IAM role) provisioned via CloudFormation Quickstart, granting Unity Catalog read access to the S3 bucket through a Unity Catalog External Location
+- **Spark SQL** — all bronze/silver/gold transform logic, ported from the original T-SQL stored procedures
 - **Git/GitHub** — version control
 
 ---
 
 ## Architecture
 
-1. **Bronze** — raw ingestion via `BULK INSERT` from CRM/ERP CSVs, truncate-and-reload pattern.
-2. **Silver** — cleansing/standardization (deduplication, trimming, type/format fixes, invalid-date handling) from Bronze.
-3. **Gold** — star-schema views (dimension + fact tables) for analytics, always live since they're views over Silver.
-4. **Orchestration** — one Airflow DAG runs `load_bronze → load_silver → quality_check_silver → quality_check_gold` daily at 2am, with each step only proceeding if the previous one succeeds.
+1. **Bronze** — `read_files()` ingests raw CRM/ERP CSVs directly from S3 into managed Delta tables, full-refresh (`CREATE OR REPLACE TABLE`), same intent as the original `BULK INSERT` truncate-and-reload.
+2. **Silver** — cleansing/standardization (deduplication, trimming, type/format fixes, invalid-date handling) via CTAS (`CREATE OR REPLACE TABLE ... AS SELECT`) from Bronze.
+3. **Gold** — star-schema views (dimension + fact tables) for analytics, unchanged in shape from the original design.
+4. **Quality gates** — Spark SQL `assert_true(condition, message)` statements enforce the same checks as the original (null/duplicate keys, invalid date ordering, referential integrity); a failed assertion fails the task.
+5. **Orchestration** — one Databricks Job (`medallion_pipeline`) runs `load_bronze → load_silver → quality_check_silver → gold_views → quality_check_gold` on a schedule, each task gated on the previous one succeeding, on Serverless compute, with email alerts on failure.
 
 ---
 
-## Troubleshooting / Problem-Solving Highlights
+## Troubleshooting / Problem-Solving Highlights — Databricks + AWS Migration
 
-**1. Docker container couldn't reach SQL Server ("Connection refused")**
-- Symptom: Airflow's task failed immediately with a networking error when trying to connect to SQL Server.
-- Diagnosis: distinguished "connection refused" (reached the host, nothing listening on the port) from a timeout (never reached it at all) — pointed to SQL Server not actually listening on a fixed TCP port.
-- Root cause: SQL Server Express was running as a named instance (`SQLEXPRESS`) using a dynamic port, and Windows Authentication only — neither works from inside a Docker container.
-- Fix: enabled SQL Server Authentication (Mixed Mode), created a dedicated `airflow_user` SQL login, enabled TCP/IP with a static port (1433) in SQL Server Configuration Manager, opened that port in Windows Firewall, and verified with `netstat` that SQL Server was actually listening before retesting.
+**1. Prior-practice workspace cleanup before building for real**
+- The Databricks catalog had leftover tutorial tables (`dirty_data_s3`, `users_dirty_csv`) and several Delta Live Tables pipeline drafts from earlier learning.
+- Key lesson: dropping a table isn't sufficient for pipeline-managed objects (streaming tables / materialized views) — the backing pipeline will recreate them on its next run unless the pipeline itself is deleted.
+- Also hit Unity Catalog metadata eventual-consistency: a `DROP SCHEMA` briefly reported a stale non-zero table count immediately after the underlying objects had actually already been removed; resolved by waiting and retrying rather than assuming something was wrong.
 
-**2. BULK INSERT permission error**
-- After fixing connectivity, `EXEC bronze.load_bronze` failed with a permissions error specific to `BULK INSERT`.
-- Diagnosis: realized `db_owner` (database-level) doesn't cover `BULK INSERT`, which requires a **server-level** permission.
-- Fix: granted `ADMINISTER BULK OPERATIONS` to the Airflow SQL login at the server level.
+**2. Connecting Unity Catalog to a real S3 bucket**
+- Needed a Unity Catalog External Location backed by a Storage Credential (AWS IAM role) to let Databricks read from the project's own S3 bucket, rather than relying on Databricks' invisible default managed storage.
+- Used AWS's CloudFormation Quickstart flow (auto-generates the IAM role/trust policy) instead of hand-authoring an IAM policy.
+- First attempt failed with `createStorageCredentials` in a `CREATE_FAILED` state; succeeded on a careful re-run with the correct Databricks account ID and personal access token.
 
-**3. Hardcoded, environment-specific file paths**
-- The bronze load procedure had `BULK INSERT ... FROM 'C:\...'` paths pointing to a folder structure from a different machine/setup than the current project location.
-- Fix: identified the mismatch by reading the actual error output, located the real dataset paths, and updated the stored procedure to match — a good example of environment-specific config not surviving a project move/rename.
+**3. SQL Warehouse compute can't execute Python**
+- Initial quality-check implementation ported the original Airflow task's PySpark logic directly, which failed immediately: *"Unsupported cell during execution. SQL warehouses only support executing SQL cells."*
+- Rather than switching the notebook to cluster-based compute (more moving parts, more cost), rewrote the checks using Spark SQL's built-in `assert_true(condition, message)` function — kept the entire pipeline on lightweight Serverless SQL Warehouse compute.
 
-**4. Turning informal data-quality scripts into automated gates**
-- The project had "quality check" SQL scripts meant to be run manually and eyeballed (comment: *"Expectation: No Results"*) — not something a computer could act on.
-- Converted the genuine pass/fail checks (null/duplicate keys, invalid date ordering, referential integrity between fact/dimension tables, etc.) into real Airflow tasks that fail the pipeline run if bad rows are found, while leaving purely exploratory checks (like "list distinct values for eyeballing") out of automation since they have no fixed right answer.
-- Hit a **false positive** almost immediately: a birthdate range check flagged 15 rows as invalid, using a cutoff of 1924. Investigated the actual flagged data, determined these were legitimate customers born in the early 1900s (not corrupted data — the original threshold was just an arbitrary guess), and adjusted the business rule to a more realistic cutoff rather than either ignoring the failure or wrongly "fixing" data that wasn't actually broken.
+**4. Porting T-SQL to Spark SQL**
+- Mostly a direct logic port, with a handful of syntax gaps: `ISNULL` → `COALESCE`, `LEN` → `LENGTH`, `GETDATE()` → `CURRENT_DATE()`.
+- The sales date columns (`sls_order_dt`, `sls_ship_dt`, `sls_due_dt`), stored as `yyyymmdd` integers, needed `TO_DATE(CAST(col AS STRING), 'yyyyMMdd')` — a plain string→date cast in Spark only parses `yyyy-MM-dd`, unlike T-SQL's more permissive implicit conversion.
+
+**5. Making Bronze reproducible, not a one-off manual upload**
+- The first Bronze load was done through Databricks' "Add Data" UI wizard — a one-time table creation, not something that could be re-triggered by a schedule.
+- Rebuilt Bronze as a `read_files()`-based SQL notebook so the entire medallion pipeline, not just Silver/Gold, reruns automatically end-to-end inside the Databricks Job — mirroring the original Airflow DAG's daily full pipeline run.
